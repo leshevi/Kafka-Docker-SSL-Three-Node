@@ -1,0 +1,58 @@
+services:
+  kafka:
+    image: apache/kafka:4.1.0
+    hostname: "${NAME_NODE}"
+    restart: always
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 60
+      net.ipv4.tcp_keepalive_intvl: 10
+      net.ipv4.tcp_keepalive_probes: 6
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      - ./certs:/etc/kafka/secrets:ro
+      - ./data:/var/lib/kafka/data
+    environment:
+      # KRaft Settings
+      KAFKA_NODE_ID: "${KAFKA_NODE_ID}"
+      KAFKA_PROCESS_ROLES: controller,broker
+      CLUSTER_ID: ZAcHwuMbR3mzboNMM8LxvQ # A unique, Base64-encoded string, e.g., 'Vq1PetVb-ZLZ-55i-QpI6A'
+
+      # Listener Configuration
+      KAFKA_LISTENERS: "CLIENT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,CONTROLLER_INTERNAL://0.0.0.0:9094" 
+      KAFKA_ADVERTISED_LISTENERS: "CLIENT://${NODE_IP}:9092,CONTROLLER://${NODE_IP}:9093,CONTROLLER_INTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CLIENT:SSL,CONTROLLER:SSL,CONTROLLER_INTERNAL:SSL"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "$QUORUM"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: CLIENT
+      KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+      
+      # SSL Configuration for the CLIENT listener
+      KAFKA_SSL_CLIENT_AUTH: required # or 'none' if only one-way SSL is needed
+      KAFKA_SSL_KEYSTORE_LOCATION:  "/etc/kafka/secrets/kafka${KAFKA_NODE_ID}.server.keystore.jks"
+      KAFKA_SSL_KEYSTORE_PASSWORD: "${PASS_KEY}"
+      KAFKA_SSL_TRUSTSTORE_LOCATION: "/etc/kafka/secrets/kafka${KAFKA_NODE_ID}.server.truststore.jks"
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: "${PASS_KEY}"
+
+      # Other general configurations
+      ALLOW_PLAINTEXT_LISTENER: no # Ensure plaintext is disabled if you want full security
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3 # Required for single node cluster
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_REQUEST_TIMEOUT_MS: 60000
+      KAFKA_CONNECTION_SETUP_TIMEOUT_MS: 10000
+      KAFKA_SOCKET_CONNECTION_SETUP_TIMEOUT_MS: 10000
+      KAFKA_METADATA_MAX_IDLE_INTERVAL_MS: 300000
+      KAFKA_METADATA_LOG_MAX_SNAPSHOT_INTERVAL_MS: 3600000
+      KAFKA_NUM_NETWORK_THREADS: 6
+      KAFKA_SSL_HANDSHAKE_TIMEOUT_MS: 30000
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+      # Крайне рекомендую также добавить настройки памяти и GC здесь же:
+      KAFKA_HEAP_OPTS: "-Xms2G -Xmx2G -XX:+UseG1GC"
+
+
+volumes:
+  kafka_data:
+    driver: local
+
