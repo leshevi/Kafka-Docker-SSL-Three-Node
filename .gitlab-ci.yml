@@ -10,7 +10,7 @@ image: alpine:latest
 variables:
   KAFKA_CERTS_DIR: "./kafka-certs"
   RENEW_DAYS: 30
-  KAFKA_SERVERS: "91.186.196.108 85.193.91.131 217.25.93.144"
+  KAFKA_SERVERS: "91.186.196.105 85.193.91.130 217.25.93.141"
   SERVER_NAMES: "kafka1 kafka2 kafka3"
   CURRENT_PASS: $PASSWORD_KEY
 
