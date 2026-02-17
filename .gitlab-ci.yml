@@ -1,0 +1,279 @@
+stages:
+  - certificates
+  - create_certificates
+  - deploy_certificates
+  - 🚀play
+  - deploy
+
+image: alpine:latest
+
+variables:
+  KAFKA_CERTS_DIR: "./kafka-certs"
+  RENEW_DAYS: 30
+  KAFKA_SERVERS: "91.186.196.108 85.193.91.131 217.25.93.144"
+  SERVER_NAMES: "kafka1 kafka2 kafka3"
+  CURRENT_PASS: $PASSWORD_KEY
+
+check_certificates:
+  stage: certificates
+  tags:
+    - Docker
+  before_script:
+    - apk add --no-cache openssh-client openssl
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  script:
+    - |
+      FIRST_SERVER=$(echo $KAFKA_SERVERS | cut -d' ' -f1)
+      CERT_PATH="~/kafka-cluster/certs/ca.crt"
+      
+      echo "Проверяем сертификат на $FIRST_SERVER..."
+      
+      # Пытаемся скачать CA сертификат для проверки
+      if scp -o StrictHostKeyChecking=no ansible@$FIRST_SERVER:$CERT_PATH ./ca.crt.tmp 2>/dev/null; then
+        # Проверяем дату истечения (в секундах)
+        EXPIRY_DATE=$(openssl x509 -enddate -noout -in ./ca.crt.tmp | cut -d= -f2)
+        EXPIRY_SECONDS=$(date -d "${EXPIRY_DATE% GMT}" +%s)
+        NOW_SECONDS=$(date +%s)
+        DIFF_DAYS=$(( ($EXPIRY_SECONDS - $NOW_SECONDS) / 86400 ))
+        
+        echo "Сертификат истекает через $DIFF_DAYS дней ($EXPIRY_DATE)"
+        
+        if [ "$DIFF_DAYS" -lt "$RENEW_DAYS" ]; then
+          echo "ВНИМАНИЕ: Срок действия истекает. Устанавливаем RENEW_CERT=true"
+          echo "RENEW_CERT=true" >> build.env
+        else
+          echo "Сертификат еще валиден."
+          echo "RENEW_CERT=false" >> build.env
+        fi
+      else
+        echo "Сертификаты не найдены на сервере. Требуется первичная генерация."
+        echo "RENEW_CERT=true" >> build.env
+      fi
+    - cat build.env
+  artifacts:
+    reports:
+      dotenv: build.env # Передает переменную RENEW_CERT в следующие стадии
+
+# 2. Генерация (запускается если RENEW_CERT=true)
+generate_certificates:
+  stage: create_certificates
+  tags:
+    - Docker
+  needs: ["check_certificates"]
+  script:
+    - if [ "$RENEW_CERT" != "true" ]; then echo "Skipping generation..."; exit 0; fi
+    - apk add --no-cache openssl openjdk17-jre-headless
+    - mkdir -p $KAFKA_CERTS_DIR
+    - |
+      openssl req -x509 -new -newkey rsa:4096 -days 3650 -nodes \
+        -keyout $KAFKA_CERTS_DIR/ca.key -out $KAFKA_CERTS_DIR/ca.crt \
+        -subj "/CN=Kafka-CA"
+
+      i=1
+      for server_ip in $KAFKA_SERVERS; do
+        server_name=$(echo $SERVER_NAMES | cut -d' ' -f$i)
+        server_name=${server_name:-server$i}
+        
+        echo "Генерация для $server_name ($server_ip)..."
+        
+        # Key & CSR
+        openssl req -new -newkey rsa:4096 -nodes \
+          -keyout "$KAFKA_CERTS_DIR/$server_name.key" \
+          -out "$KAFKA_CERTS_DIR/$server_name.csr" \
+          -subj "/CN=$server_name" \
+          -addext "subjectAltName=DNS:$server_name,IP:$server_ip"
+
+        # Sign with CA
+        openssl x509 -req -in "$KAFKA_CERTS_DIR/$server_name.csr" -days 365 \
+          -CA $KAFKA_CERTS_DIR/ca.crt -CAkey $KAFKA_CERTS_DIR/ca.key \
+          -CAcreateserial -out "$KAFKA_CERTS_DIR/$server_name.crt" \
+          -copy_extensions copy
+
+        # JKS (Keystore)
+        openssl pkcs12 -export -in "$KAFKA_CERTS_DIR/$server_name.crt" \
+          -inkey "$KAFKA_CERTS_DIR/$server_name.key" \
+          -out "$KAFKA_CERTS_DIR/$server_name.p12" \
+          -name "$server_name" -passout "pass:$CURRENT_PASS"
+
+        keytool -importkeystore -deststorepass "$CURRENT_PASS" -destkeystore "$KAFKA_CERTS_DIR/$server_name.server.keystore.jks" \
+          -srckeystore "$KAFKA_CERTS_DIR/$server_name.p12" -srcstoretype PKCS12 -srcstorepass "$CURRENT_PASS"
+
+        # Truststore
+        keytool -import -alias CARoot -file $KAFKA_CERTS_DIR/ca.crt \
+          -keystore "$KAFKA_CERTS_DIR/$server_name.server.truststore.jks" -storepass "$CURRENT_PASS" -noprompt
+        
+       
+      cat > "$KAFKA_CERTS_DIR/$server_name.client.properties" << EOF
+        security.protocol=SSL
+        ssl.truststore.location=/etc/kafka/secrets/$server_name.server.truststore.jks
+        ssl.truststore.password=$CURRENT_PASS
+        ssl.keystore.location=/etc/kafka/secrets/$server_name.server.keystore.jks
+        ssl.keystore.password=$CURRENT_PASS
+        ssl.endpoint.identification.algorithm=
+      EOF
+
+        i=$((i + 1))
+      done
+  artifacts:
+    paths:
+      - $KAFKA_CERTS_DIR/
+    expire_in: 1 week
+
+# 3. Деплой сертификатов
+deploy_certificates:
+  stage: deploy_certificates
+  tags:
+    - Docker
+  when: manual
+  needs: ["generate_certificates"]
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  script:
+    - |
+      i=1
+      for server_ip in $KAFKA_SERVERS; do
+        server_name=$(echo $SERVER_NAMES | cut -d' ' -f$i)
+        echo "Копирование на $server_ip ($server_name)..."
+        
+        ssh -o StrictHostKeyChecking=no ansible@$server_ip "mkdir -p ~/kafka-cluster/certs"
+        
+        scp -o StrictHostKeyChecking=no \
+          $KAFKA_CERTS_DIR/$server_name.server.keystore.jks \
+          $KAFKA_CERTS_DIR/$server_name.server.truststore.jks \
+          $KAFKA_CERTS_DIR/$server_name.client.properties \
+          $KAFKA_CERTS_DIR/ca.crt \
+          ansible@$server_ip:~/kafka-cluster/certs/
+        
+        i=$((i+1))
+      done
+
+🚀generate_inventory_roles_and_play:
+  stage: 🚀play
+  variables:
+    ANSIBLE_FORCE_COLOR: "1"
+    ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+    ANSIBLE_REMOTE_TMP: /tmp
+    ANSIBLE_STARATEGY: linear
+    ANSIBLE_PIPELINING: 1
+    ANSIBLE_TRANSPORT: ssh
+    ANSIBLE_BECOME_METHOD: su
+    ANSIBLE_BECOME_USER: root
+    ANSIBLE_BECOME_ASKPASS: 'False'
+    ANSIBLE_FORCE_HANDLER: 'True'
+    ANSIBLE_STDOUT_CALLBACK: "ansible.builtin.default"
+    ANSIBLE_ASK_PASS: 'False'
+    ANSIBLE_NOCOWS: 1
+    ANSIBLE_HOST_KEY_CHECKING: 'false'
+    ANSIBLE_BECOME_EXE: 'sudo -p "Password: " su -'
+    ANSIBLE_DEPRECATION_WARNINGS: 'False'
+    ANSIBLE_TIMEOUT: 30
+  tags:
+    - Docker
+  when: manual
+  script:
+    - apk add --no-cache openssh-client ansible git
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - |
+      cat > hosts.yml << EOF
+      ---
+      all:
+        vars:
+          ansible_user: ansible
+      EOF
+      echo "  hosts:" >> hosts.yml
+      i=1
+      for server_ip in $KAFKA_SERVERS; do
+        server_name=$(echo $SERVER_NAMES | cut -d' ' -f$i)
+        echo "    $server_name:" >> hosts.yml
+        echo "      ansible_host: $server_ip" >> hosts.yml
+        i=$((i+1))
+      done
+
+      echo "Generated hosts.yml:"
+      cat hosts.yml
+    - |
+      if [ -f requirements1.yml ]; then
+        echo "Installing roles from requirements1.yml..."
+        ansible-galaxy install -r requirements1.yml --ignore-errors -p roles/ --force
+      else
+        echo "No requirements.yml found, creating example..."
+        cat > requirements1.yml << EOF
+        # roles from GitLab
+        - src: 'https://oauth2:${ANSIBLE_TOKEN}@gitlab.com/ansible_playbooks7843206/docker.git'
+          version: main
+          name: docker
+          scm: 'git'
+        - src: 'https://oauth2:${ANSIBLE_TOKEN}@gitlab.com/ansible_playbooks7843206/hosts_create.git'
+          version: main
+          name: hosts
+          scm: 'git'
+      EOF
+
+        ansible-galaxy install -r requirements1.yml -p roles/ --force
+      fi
+
+      echo "Installed roles:"
+      ls -la roles/
+    - rm requirements1.yml
+    - ansible --version
+    - ansible all -i hosts.yml -m ping
+    - |
+      echo "Current directory structure:"
+      ls -la
+
+      echo "Inventory file:"
+      cat hosts.yml
+
+      echo "Running playbook..."
+      ansible-playbook -i hosts.yml playbook.yml --limit all
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+
+# 4. Деплой кластера
+deploy-kafka-cluster:
+  stage: deploy
+  tags:
+    - Docker
+  when: manual
+  before_script:
+    - apk add --no-cache openssh-client docker-compose gettext
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  script:
+    - |
+      i=1
+      for server_ip in $KAFKA_SERVERS; do
+        server_name=$(echo $SERVER_NAMES | cut -d' ' -f$i)
+        echo "Копирование на $server_ip ($server_name)..."
+        export KAFKA_NODE_ID=$i
+        export NODE_IP=$server_ip
+        export PASS_KEY=$PASSWORD_KEY
+        export NAME_NODE=$server_name
+        n=1
+        for ip in $KAFKA_SERVERS; do
+          echo "Работаю с IP: $ip"
+          echo -n $n@$ip:9093, >> file.txt
+          n=$((n+1))
+        done
+        sed -i '$ s/,$//' file.txt
+        export QUORUM=$(cat "file.txt")
+        rm file.txt
+        envsubst < docker-compose.templates.yml > docker-compose.yml
+        # Создаем индивидуальный compose
+        sed "s/YOUR_SERVER_IP/$server_ip/g" docker-compose.yml > "docker-compose.$server_ip.yml"
+        
+        scp -o StrictHostKeyChecking=no "docker-compose.$server_ip.yml" ansible@$server_ip:~/kafka-cluster/docker-compose.yml
+        
+        ssh -o StrictHostKeyChecking=no ansible@$server_ip "cd ~/kafka-cluster && docker compose up -d"
+        i=$((i+1))
+      done
+      ssh -o StrictHostKeyChecking=no ansible@$server_ip "cd ~/kafka-cluster && \
+        docker compose exec -T kafka /opt/kafka/bin/kafka-metadata-quorum.sh \
+        --bootstrap-server localhost:9092 \
+        --command-config /etc/kafka/secrets/$server_name.client.properties \
+        describe --status"
